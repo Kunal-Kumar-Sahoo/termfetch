@@ -4,34 +4,25 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageColor, ImageEnhance
 
-# Luminance ramps, darkest first. The renderer picks a character by pixel brightness.
 RAMPS = {
-    # Classic neofetch-ish ASCII. Reads as art at small sizes.
     "ascii": " .`':,^;~-+=*x?%#&@$",
-    # Unicode shade blocks. Smoother gradient, still obviously "terminal".
     "blocks": " ░▒▓█",
-    # Every cell a full block: the image is reproduced as flat colour, no texture.
     "solid": "█",
 }
 
-# Upper-half block. Each cell carries two pixels — the glyph paints the top one and a
-# background rect paints the bottom — which doubles vertical resolution for free.
 HALF_BLOCK = "▀"
 HALFBLOCK_CHARSET = "halfblocks"
-
-# Width divided by height of one character cell. Must match the geometry the renderer
-# actually uses (svg.CHAR_WIDTH_RATIO over a one-em line height) or the art comes out
-# stretched along one axis.
 DEFAULT_CHAR_ASPECT = 0.6
+ALPHA_THRESHOLD = 16
 
 
 @dataclass(frozen=True)
 class Cell:
     char: str
-    color: str  # "#rrggbb"
-    bg: str | None = None  # set for half-block cells: the colour of the lower pixel
+    color: str
+    bg: str | None = None
 
 
 @dataclass(frozen=True)
@@ -44,32 +35,56 @@ class Art:
 
     @property
     def width(self) -> int:
-        return max((len(r) for r in self.rows), default=0)
+        return max((len(row) for row in self.rows), default=0)
 
     def as_text(self) -> str:
-        """Plain-text version, for previewing in a terminal."""
-        return "\n".join("".join(c.char for c in row) for row in self.rows)
+        return "\n".join(
+            "".join(cell.char for cell in row)
+            for row in self.rows
+        )
 
     def as_ansi(self) -> str:
-        out = []
+        output = []
+
         for row in self.rows:
             line = []
+
             for cell in row:
-                r, g, b = (int(cell.color[i : i + 2], 16) for i in (1, 3, 5))
-                line.append(f"\x1b[38;2;{r};{g};{b}m{cell.char}")
-            out.append("".join(line) + "\x1b[0m")
-        return "\n".join(out)
+                r, g, b = (
+                    int(cell.color[i:i + 2], 16)
+                    for i in (1, 3, 5)
+                )
+                line.append(
+                    f"\x1b[38;2;{r};{g};{b}m{cell.char}"
+                )
+
+            output.append("".join(line) + "\x1b[0m")
+
+        return "\n".join(output)
 
 
 def _quantize_channel(value: int, step: int) -> int:
-    """Snap a channel to a coarser grid so neighbouring cells share colours.
-
-    Identical adjacent colours collapse into a single SVG span, which cuts the output
-    size substantially on photographic input.
-    """
     if step <= 1:
         return value
+
     return min(255, (value + step // 2) // step * step)
+
+
+def _blend_color(
+    foreground: str,
+    background: str,
+    alpha: int,
+) -> str:
+    fg = ImageColor.getrgb(foreground)
+    bg = ImageColor.getrgb(background)
+    opacity = alpha / 255
+
+    channels = [
+        round(f * opacity + b * (1 - opacity))
+        for f, b in zip(fg, bg)
+    ]
+
+    return "#%02x%02x%02x" % tuple(channels)
 
 
 def render(
@@ -85,38 +100,84 @@ def render(
     gamma: float = 1.0,
     color_step: int = 8,
     invert: bool = False,
+    background_color: str = "#0d1117",
+    shadow_lift: float = 0.0,
+    preserve_foreground: bool = False,
 ) -> Art:
-    """Render ``path`` as a grid of coloured characters.
-
-    ``crop`` is an (x, y, w, h) box applied before scaling. ``cols`` sets the width in
-    characters; the row count follows from the image aspect ratio and ``char_aspect``.
-    """
     half = charset == HALFBLOCK_CHARSET
+
     if not half and charset not in RAMPS:
         raise ValueError(
             f"unknown charset {charset!r}; expected one of "
             f"{sorted([*RAMPS, HALFBLOCK_CHARSET])}"
         )
+
+    if cols < 1:
+        raise ValueError("cols must be positive")
+
+    if char_aspect <= 0:
+        raise ValueError("char_aspect must be positive")
+
+    if gamma <= 0:
+        raise ValueError("gamma must be positive")
+
+    if not 0.0 <= shadow_lift <= 1.0:
+        raise ValueError("shadow_lift must be between 0 and 1")
+
     ramp = RAMPS.get(charset, "")
 
-    img = Image.open(path).convert("RGB")
+    source = Image.open(path).convert("RGBA")
+
     if crop:
         x, y, w, h = crop
-        img = img.crop((x, y, x + w, y + h))
+        source = source.crop((x, y, x + w, y + h))
+
+    alpha = source.getchannel("A")
+
+    background_rgb = ImageColor.getrgb(background_color)
+    background = Image.new(
+        "RGBA",
+        source.size,
+        (*background_rgb, 255),
+    )
+
+    image = Image.alpha_composite(
+        background,
+        source,
+    ).convert("RGB")
 
     if contrast != 1.0:
-        img = ImageEnhance.Contrast(img).enhance(contrast)
-    if brightness != 1.0:
-        img = ImageEnhance.Brightness(img).enhance(brightness)
+        image = ImageEnhance.Contrast(image).enhance(contrast)
 
-    rows = max(1, round(cols * char_aspect * img.height / img.width))
-    # Half-block cells stack two pixels vertically, so sample twice as many rows.
-    img = img.resize((cols, rows * 2 if half else rows), Image.LANCZOS)
+    if brightness != 1.0:
+        image = ImageEnhance.Brightness(image).enhance(brightness)
+
+    rows = max(
+        1,
+        round(cols * char_aspect * image.height / image.width),
+    )
+
+    image_size = (
+        cols,
+        rows * 2 if half else rows,
+    )
+
+    image = image.resize(
+        image_size,
+        Image.Resampling.LANCZOS,
+    )
+
+    alpha = alpha.resize(
+        image_size,
+        Image.Resampling.LANCZOS,
+    )
 
     def colour_at(x: int, y: int) -> str:
-        r, g, b = img.getpixel((x, y))
+        r, g, b = image.getpixel((x, y))
+
         if not colored:
             return mono_color
+
         return "#%02x%02x%02x" % (
             _quantize_channel(r, color_step),
             _quantize_channel(g, color_step),
@@ -124,25 +185,66 @@ def render(
         )
 
     if half:
-        return Art(
+        return Art([
             [
-                [Cell(HALF_BLOCK, colour_at(x, y * 2), colour_at(x, y * 2 + 1)) for x in range(cols)]
-                for y in range(rows)
+                Cell(
+                    HALF_BLOCK,
+                    colour_at(x, y * 2),
+                    colour_at(x, y * 2 + 1),
+                )
+                for x in range(cols)
             ]
-        )
+            for y in range(rows)
+        ])
 
     grid: list[list[Cell]] = []
+
     for y in range(rows):
         line: list[Cell] = []
+
         for x in range(cols):
-            r, g, b = img.getpixel((x, y))
-            # Rec. 709 luma; matches how bright the colour actually looks.
-            lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+            a = alpha.getpixel((x, y))
+
+            if a < ALPHA_THRESHOLD:
+                line.append(Cell(" ", mono_color))
+                continue
+
+            r, g, b = image.getpixel((x, y))
+
+            lum = (
+                0.2126 * r
+                + 0.7152 * g
+                + 0.0722 * b
+            ) / 255
+
+            if shadow_lift:
+                lift = shadow_lift * (1.0 - lum)
+
+                r = round(r + (255 - r) * lift)
+                g = round(g + (255 - g) * lift)
+                b = round(b + (255 - b) * lift)
+
+                lum = (
+                    0.2126 * r
+                    + 0.7152 * g
+                    + 0.0722 * b
+                ) / 255
+
             if gamma != 1.0:
                 lum = lum ** (1.0 / gamma)
+
             if invert:
                 lum = 1.0 - lum
-            char = ramp[min(len(ramp) - 1, int(lum * len(ramp)))]
+
+            index = min(
+                len(ramp) - 1,
+                int(lum * len(ramp)),
+            )
+
+            if preserve_foreground and len(ramp) > 1:
+                index = max(1, index)
+
+            char = ramp[index]
 
             if colored:
                 color = "#%02x%02x%02x" % (
@@ -151,8 +253,14 @@ def render(
                     _quantize_channel(b, color_step),
                 )
             else:
-                color = mono_color
+                color = _blend_color(
+                    mono_color,
+                    background_color,
+                    a,
+                )
+
             line.append(Cell(char, color))
+
         grid.append(line)
 
     return Art(grid)

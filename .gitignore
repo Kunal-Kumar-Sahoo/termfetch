@@ -1,15 +1,31 @@
-__pycache__/
-*.py[cod]
+# Python environments
 .venv/
 venv/
+env/
+
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
 .pytest_cache/
-dist/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build artifacts
 build/
+dist/
 *.egg-info/
+
+# Local configuration and profile assets
+termfetch.json
+assets/portrait.png
+profile-card.svg
+profile-preview.txt
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# OS files
 .DS_Store
-.dev.vars
-launch-assistant/.dev.vars
-launch-assistant/.access.vars
-launch-assistant/node_modules/
-launch-assistant/dist/
-launch-assistant/.wrangler/
